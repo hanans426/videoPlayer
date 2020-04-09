@@ -191,9 +191,9 @@ namespace {
 
 }
 
-int main() {
-    cout << "simple player" << endl;
-    string inputFile = "/Users/gaohan/Desktop/out1.mp4";
-    playVideo(inputFile);
-    return 0;
-}
+//int main() {
+//    cout << "simple player" << endl;
+//    string inputFile = "/Users/gaohan/Desktop/out1.mp4";
+//    playVideo(inputFile);
+//    return 0;
+//}
