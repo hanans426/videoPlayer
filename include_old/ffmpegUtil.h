@@ -1,7 +1,6 @@
 //
 // Created by 高涵 on 2020-04-02.
 //
-
 #pragma once
 
 #ifdef _WIN32
@@ -32,12 +31,24 @@ extern "C" {
 #include <iostream>
 #include <sstream>
 #include <tuple>
+#include <list>
+#include <deque>
+#include <mutex>
 
-namespace ffmpegUtil{
+
+namespace ffmpegUtil {
+
     using std::cout;
     using std::endl;
     using std::string;
     using std::stringstream;
+    using std::list;
+    using std::unique_ptr;
+    using std::mutex;
+    using std::deque;
+
+
+    class ReSampler;
 
     struct ffutils{
 
@@ -69,7 +80,7 @@ namespace ffmpegUtil{
             (*avCodecContext) = avcodec_alloc_context3(codec);
             auto codecCtx = *avCodecContext;
 
-            //Fill the codec context based on the values from the supplied codec parameters
+            //将媒体流中的编码器参数设置到codecCtx中
             if(avcodec_parameters_to_context(codecCtx, formatContext->streams[streamIndex]->codecpar) != 0){
                 string errorMsg = "Could not copy codec context";
                 errorMsg += codec->name;
@@ -77,6 +88,7 @@ namespace ffmpegUtil{
                 throw std::runtime_error(errorMsg);
             }
 
+            //初始化编码器
             if(avcodec_open2(codecCtx, codec, nullptr) < 0){
                 string errorMsg = "Could not open codec: ";
                 errorMsg += codec->name;
@@ -89,6 +101,55 @@ namespace ffmpegUtil{
         }
 
     };
+
+class PacketGrabber{
+    const string inputUrl;
+    AVFormatContext* formatCtx  = nullptr;
+    bool streamEnd = false;
+
+public:PacketGrabber(const string& url)
+            :inputUrl(url){
+        formatCtx = avformat_alloc_context();
+    }
+
+    void init(){
+        if(avformat_open_input(&formatCtx, inputUrl.c_str(), NULL, NULL) != 0){
+            string errorMsg = "Can not open input file:";
+            errorMsg += inputUrl;
+            cout << errorMsg << endl;
+            throw std::runtime_error(errorMsg);
+        }
+
+        if(avformat_find_stream_info(formatCtx, NULL) <0){
+            string errorMsg = "Can not find stream information in input file:";
+            errorMsg += inputUrl;
+            cout << errorMsg << endl;
+            throw std::runtime_error(errorMsg);
+        }
+    }
+
+    int grabPkt(AVPacket* packet){
+        if (av_read_frame(formatCtx, packet) >= 0) {
+//            cout << "read a packet" << endl;
+        }else{
+            cout << "stream ends." << endl;
+            streamEnd = true;
+            return -1;
+        }
+        return 0;
+    }
+
+    AVFormatContext* get_ctx(){
+        return formatCtx;
+    }
+
+    bool isEnd(){
+        return streamEnd;
+    }
+
+};
+
+
 
 
 class FrameGrabber{
@@ -108,6 +169,19 @@ class FrameGrabber{
     AVPacket* packet = (AVPacket*) av_malloc(sizeof(AVPacket));
     bool isEnd = false;
 
+
+    deque<AVPacket> packet_que = {};
+    mutex packet_que_mutex{};
+
+    int64_t clock = 0;
+    mutex clock_mutex;
+
+
+protected:
+
+
+    AVRational streamTimeBase{1, 0};
+
     int grabFrameByType(AVFrame* frame, AVMediaType streamType){
         int ret = -1;
         int targetStream;
@@ -126,12 +200,15 @@ class FrameGrabber{
 
         while(true){
             int currentPacketStreamIndex = -1;
-            while(!isEnd){
-                if(av_read_frame(formatCtx, packet) >= 0){
+//            while(!isEnd){
+   //             if(av_read_frame(formatCtx, packet) >= 0){
+                    get_packet(packet);
                     currentPacketStreamIndex = packet->stream_index;
+
                     if(packet->stream_index == videoIndex && videoEnabled){ //处理视频
                         //feed video packet to codec
                         ret = avcodec_send_packet(vCodecCtx, packet);
+                        printf("-----------%d\n", ret);
 
                         if(ret == 0){
                             av_packet_unref(packet);
@@ -145,10 +222,17 @@ class FrameGrabber{
 
 
                     } else if(packet->stream_index == audioIndex && audioEnabled){//处理音频
+
+                        if (packet->pts != AV_NOPTS_VALUE) {
+                            set_pts(packet->pts * av_q2d(streamTimeBase) * 1000 );
+                        }
+                        set_pts(clock + 1000 * packet->size/((double) 44100 * 2 * 2));
+
                         ret = avcodec_send_packet(aCodecCtx, packet);
+                        printf("================%d\n", ret);
 
                         if(ret == 0){
-                            av_packet_unref(packet);
+                           av_packet_unref(packet);
                             break;
                         } else {
                             string errorMsg = "[AUDIO] avcodec_send_packet error: ";
@@ -162,21 +246,21 @@ class FrameGrabber{
                         ss<<"av_read_frame skip packe in streanIndex ="<<currentPacketStreamIndex;
                         av_packet_unref(packet);   // 丢弃被跳过的packet
                     }
-                } else {
-                    isEnd = true;
-                    if(vCodecCtx != nullptr) avcodec_send_packet(vCodecCtx, nullptr);
-                    if(aCodecCtx != nullptr) avcodec_send_packet(aCodecCtx, nullptr);
-                    break;
-                }
-            }
+            //}
 
             ret = -1;
 
             if(currentPacketStreamIndex == videoIndex && videoEnabled){
                 ret = avcodec_receive_frame(vCodecCtx, frame);
-                cout<<"Video avcodec receive frame"<< endl;
+                if(frame->best_effort_timestamp != AV_NOPTS_VALUE){
+                    set_pts(frame->pts * av_q2d(streamTimeBase) * 1000);
+                }
             } else if(currentPacketStreamIndex == audioIndex && audioEnabled){
                 ret = avcodec_receive_frame(aCodecCtx, frame);
+
+//                if(frame->best_effort_timestamp != AV_NOPTS_VALUE){
+//                    set_pts(frame->pts * av_q2d(streamTimeBase) * 1000);
+//                }
             } else{
                 if(isEnd){
                     cout << "no more frames." << endl;
@@ -189,7 +273,7 @@ class FrameGrabber{
             }
 
             if(ret == 0){
-                if(targetStream = -1 || currentPacketStreamIndex == targetStream){ //??????
+                if(targetStream = -1 || currentPacketStreamIndex == targetStream){
                     stringstream ss{};
                     ss << "avcodec_receive_frame ret == 0. got [" << targetStream << "] ";
 
@@ -208,18 +292,21 @@ class FrameGrabber{
                 }
 
             } else if(ret == AVERROR(EAGAIN)){
-//                 string errorMsg = "avcodec_receive_frame EAGAIN, it should never happen. ";
-//                 errorMsg += ret;
-//                 cout << errorMsg << endl;
-//                 throw std::runtime_error(errorMsg);
-                 continue;
-            } else {
+                cout << "need more packet." << endl;
+            } else if(ret == AVERROR_EOF){
+                cout << "+++++++++++++no more output frames. index="
+                     << packet->stream_index<< endl;
+            }else {
                 string errorMsg = "avcodec_receive_frame error: ";
                 errorMsg += ret;
                 cout << errorMsg << endl;
                 throw std::runtime_error(errorMsg);
             }
+
+//            av_frame_free(&frame);
+//            av_packet_free(&packet);
         }
+
     }
 
 public:
@@ -245,10 +332,12 @@ public:
         for(int i = 0; i < formatCtx->nb_streams; i++){
             if(formatCtx->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO && videoIndex == -1){
                 videoIndex = i;
-                cout << "video stream index = : [" << i << "]" << endl;
+                streamTimeBase = formatCtx->streams[i]->time_base;
+                cout << "video stream index = : [" << i<< "]" << endl;
             }
             if(formatCtx->streams[i]->codec->codec_type == AVMEDIA_TYPE_AUDIO && audioIndex == -1){
                 audioIndex = i;
+                streamTimeBase = formatCtx->streams[i]->time_base;
                 cout << "audio stream index = : [" << i << "]" << endl;
             }
 
@@ -278,10 +367,57 @@ public:
         }
 
         cout<<"-----------------File Information---------------"<< endl;
-        av_dump_format(formatCtx, videoIndex, inputUrl.c_str(), 0); //Print detailed information about the input or output format
+        //av_dump_format(formatCtx, videoIndex, inputUrl.c_str(), 0); //Print detailed information about the input or output format
         cout << "-------------------------------------------------\n" << endl;
         packet = (AVPacket*)av_malloc(sizeof(AVPacket));
 
+    }
+
+    bool need_new_packet(){
+        return packet_que.size() < 3;
+    }
+
+    void push_packet(AVPacket *packet){
+        std::lock_guard<std::mutex> lock(packet_que_mutex);
+        packet_que.push_back(*packet);
+    }
+
+    void get_packet(AVPacket *packet){
+        std::lock_guard<std::mutex> lock(packet_que_mutex);
+        *packet = packet_que.front();
+        packet_que.pop_front();
+    }
+
+    int64_t get_pts(){
+        std::lock_guard<std::mutex> lock(clock_mutex);
+        return clock;
+    }
+
+    void set_pts(int64_t pts){
+        std::lock_guard<std::mutex> lock(clock_mutex);
+        clock = pts;
+    }
+    int get_video_idx(){
+        return videoIndex;
+    }
+
+    int get_audio_idx(){
+        return audioIndex;
+    }
+
+    bool fileIsEnd(){
+        return isEnd;
+    }
+
+    int grabPkt(AVPacket* packet){
+        if (av_read_frame(formatCtx, packet) >= 0) {
+//            cout << "read a packet" << endl;
+        }else{
+            cout << "stream ends." << endl;
+            isEnd = true;
+            return -1;
+        }
+        return 0;
     }
 
     void close(){
@@ -351,6 +487,13 @@ public:
             throw  std::runtime_error("can not get audio sampleRate");
         }
     }
+    int getSample() const {
+        if(aCodecCtx != nullptr){
+            return aCodecCtx->frame_size;
+        } else {
+            throw  std::runtime_error("can not get audio sampleRate");
+        }
+    }
 
     int getChannels() const {
         if(aCodecCtx != nullptr){
@@ -401,7 +544,7 @@ struct AudioInfo{
 class ReSampler{
     SwrContext* swr; // 重采样结构体，改变音频的采样率等参数
 
- public:
+public:
     ReSampler(const ReSampler&) = delete;
     ReSampler(ReSampler&&) noexcept = delete;
     ReSampler operator = (const ReSampler&) = delete;

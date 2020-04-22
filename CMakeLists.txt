@@ -7,7 +7,9 @@ IF(MSVC)
     SET(CMAKE_CXX_FLAGS "/EHsc")  # deal with MSVC Warning C4530
 ENDIF(MSVC)
 
-add_executable(videoPlayer src/playVideo.cpp include/ffmpegutil.h src/playAudio.cpp)
+#add_executable(videoPlayer src_old/playVideo.cpp src_old/playAudio.cpp src_old/main.cpp src_old/playVideoWithAudio.cpp include/ffmpegUtil.h)
+add_executable(videoPlayer src/playAudio.cpp src/playVideo.cpp src/main.cpp)
+#add_executable(videoPlayer  src_old/main.cpp )
 
 ######################################
 #  FFmpeg lib setting

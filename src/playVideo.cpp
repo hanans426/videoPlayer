@@ -1,199 +1,133 @@
 //
-// Created by 高涵 on 2020-04-02.
+// Created by 高涵 on 2020/4/19.
 //
 
-#include <iostream>
-#include <fstream>
-#include "ffmpegUtil.h"
 
-extern "C" {
-#include "SDL2/SDL.h"
-};
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <VideoProcessor.h>
+#include <AudioProcessor.h>
+#include <fstream>
+#include <time.h>
 
 #define REFRESH_EVENT (SDL_USEREVENT + 1)
 
 #define BREAK_EVENT (SDL_USEREVENT + 2)
 
-#define VIDEO_FINISH (SDL_USEREVENT + 3)
+extern "C"{
+#include "SDL2/SDL.h"
+#include "libavcodec/avcodec.h"
+#include "libswscale/swscale.h"
+#include "libavutil/imgutils.h"
+}
 
-using std::cout;
-using std::endl;
-using std::string;
+int thread_exit = 0;
 
-//namespace ffmpegUtil{
-//    extern void writeY420pFrame2Buffer(char* buffer, AVFrame* frame);
-//}
-namespace {
-    using namespace ffmpegUtil;
+int time_interval = 0;
 
-    int thread_exit = 0;
+void push_refresh_event(){
+    SDL_Event event;
+    event.type = REFRESH_EVENT;
+    SDL_PushEvent(&event);
+}
 
-    const int bpp = 12;
+int refreshPicture(void* opaque){
+    while(!thread_exit){
+        push_refresh_event();
+        auto temp_interval = time_interval > 20 ? time_interval : 20;
+        temp_interval = temp_interval < 60 ? temp_interval : 60;
+        SDL_Delay(temp_interval);
+    }
+    thread_exit=0;
+    SDL_Event event;
+    event.type = BREAK_EVENT;
+    SDL_PushEvent(&event);
+    return 0;
+}
 
-    int screen_w = 640;
-    int screen_h = 360;
-    const int pixel_w = 1920;
-    const int pixel_h = 1080;
+int playVideo(VideoProcessor* v_pro, AudioProcessor* a_pro){
 
-    const int bufferSize = pixel_w * pixel_h * bpp / 8;
-    unsigned char buffer[bufferSize];
+    int screen_w = v_pro->getWidth();
+    int screen_h = v_pro->getHeight();
 
-    int refreshPicture(void* opaque){
-        int timeInterval = *((int*)opaque);
-        thread_exit = 0;
-        while (!thread_exit) {
-            SDL_Event event;
-            event.type = REFRESH_EVENT;
-            SDL_PushEvent(&event);
-            SDL_Delay(timeInterval);
-        }
-        thread_exit = 0;
-        // Break
-        SDL_Event event;
-        event.type = BREAK_EVENT;
-        SDL_PushEvent(&event);
+    SDL_Window *screen = SDL_CreateWindow("simple player", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+                              screen_w, screen_h,SDL_WINDOW_SHOWN);
 
-        return 0;
-
+    if(!screen) {
+        string errMsg = "SDL: could not create window - exiting:";
+        errMsg += SDL_GetError();
+        cout << errMsg << endl;
+        throw std::runtime_error(errMsg);
     }
 
-    void playMediaVideo(const string& inputFile){
-        FrameGrabber grabber{inputFile, true, false};
-        grabber.start();
+    SDL_Renderer *sdlRenderer = SDL_CreateRenderer(screen, -1, 0);
 
-        const int w = grabber.getWidth();
-        const int h = grabber.getHeight();
-        const auto fmt = AVPixelFormat(grabber.getPixelFormat());
+    SDL_Texture *sdlTexture = SDL_CreateTexture(sdlRenderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, screen_w, screen_h);
 
-        if(SDL_Init(SDL_INIT_VIDEO)){
-            string errMsg = "Could not init SDL";
-            errMsg += SDL_GetError();
-            cout<< errMsg << endl;
-            throw std::runtime_error(errMsg);
-        }
+    time_interval = 1000/v_pro->get_frame_rate();
 
-        SDL_Window* screen;
-        screen = SDL_CreateWindow("little video player", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, w, h, SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE);
+    SDL_Thread* video_refresh= SDL_CreateThread(refreshPicture, "video_refresh", NULL);
 
-        if(!screen){
-            string errMsg = "SDL: could not create window - exiting:";
-            errMsg += SDL_GetError();
-            cout << errMsg << endl;
-            throw std::runtime_error(errMsg);
-        }
-
-        SDL_Renderer* sdlRenderer = SDL_CreateRenderer(screen, -1, 0);
-
-        Uint32 pixFmt = SDL_PIXELFORMAT_IYUV;
-
-        SDL_Texture* sdlTexture = SDL_CreateTexture(sdlRenderer, pixFmt, SDL_TEXTUREACCESS_STREAMING, w,h);
-
-
-        std::ifstream is{inputFile, std::ios::binary}; //????????????????
-        if(!is.is_open()){
-            string errMsg = "cannot open this file:";
-            errMsg += inputFile;
-            cout << errMsg << endl;
-            throw std::runtime_error(errMsg);
-        }
-
-        try{
-            int timeInterval = 1000 / (int)grabber.getFrameRate();
-            cout << "timeInterval: " << timeInterval << endl;
-
-            SDL_Thread* refresh_thread = SDL_CreateThread(refreshPicture,"refreshPictureThread", &timeInterval);
-
-            AVFrame* frame = av_frame_alloc();
-            int ret;
-            bool videoFinish = false;
-
-            SDL_Event event;
-
-            struct SwsContext* sws_ctx = sws_getContext(w, h, fmt, w, h, AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
-
-            int numByte = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, w, h, 32);
-            uint8_t* buffer = (uint8_t*) av_malloc(numByte * sizeof(uint8_t));
-            AVFrame* pict = av_frame_alloc();
-            av_image_fill_arrays(pict->data, pict->linesize, buffer, AV_PIX_FMT_YUV420P, w, h, 32);
-
-            while (true){
-                if(!videoFinish){
-                    ret = grabber.grabImageFrame(frame);
-
-                    if (ret == 1) {  // success.
-                        // ffmpegUtil::writeY420pFrame2Buffer(reinterpret_cast<char*>(buffer), frame);
-
-                        sws_scale(sws_ctx, (uint8_t const* const*)frame->data, frame->linesize, 0, h,
-                                  pict->data, pict->linesize);
-
-                    } else if (ret == 0) {  // no more frame.
-                        cout << "VIDEO FINISHED." << endl;
-                        videoFinish = true;
-                        SDL_Event finishEvent;
-                        finishEvent.type = VIDEO_FINISH;
-                        SDL_PushEvent(&finishEvent);
-                    } else {  // error.
-                        string errMsg = "grabImageFrame error.";
-                        cout << errMsg << endl;
-                        throw std::runtime_error(errMsg);
-                    }
-
-                }else {
-                    thread_exit = 1;
-                    break;
+    try {
+        SDL_Event event;
+        while (true) {
+            SDL_WaitEvent(&event);
+            if (event.type == REFRESH_EVENT) {
+                if (v_pro->get_closed()) {
+                    SDL_Event event;
+                    event.type = BREAK_EVENT;
+                    SDL_PushEvent(&event);
                 }
-                SDL_WaitEvent(&event);
-                if(event.type == REFRESH_EVENT){
-                    SDL_UpdateYUVTexture(sdlTexture,
-                                        NULL,
-                                        pict->data[0],
-                                        pict->linesize[0],
-                                        pict->data[1],
-                                        pict->linesize[1],
-                                        pict->data[2],
-                                        pict->linesize[2]);
+                v_pro->grabImage();
 
+                // 同步判断
+                auto vPts = v_pro->get_pts();
+                auto aPts = a_pro->get_pts();
+                cout << "video_pts==========" << vPts << endl;
+                cout << "audio_pts----------" << aPts << endl;
+                auto diff = v_pro->get_pts() - a_pro->get_pts();
+                if (vPts > aPts && vPts - aPts > 30) {
+                    cout << "video faster diff is " << diff << endl;
+                    time_interval = time_interval + 20;
+                } else if (aPts > vPts && aPts - vPts > 30) {
+                    time_interval = 1000 / v_pro->get_frame_rate();
+                    cout << "video slow diff is" << diff << endl;
+                    push_refresh_event();
+                }
+                AVFrame *frame = v_pro->frame;
+
+                if (frame->width != 0) {
+                    SDL_UpdateYUVTexture(sdlTexture, NULL,
+                                         frame->data[0],
+                                         frame->linesize[0],
+                                         frame->data[1],
+                                         frame->linesize[1],
+                                         frame->data[2],
+                                         frame->linesize[2]);
                     SDL_RenderClear(sdlRenderer);
                     SDL_RenderCopy(sdlRenderer, sdlTexture, NULL, NULL);
                     SDL_RenderPresent(sdlRenderer);
-                } else if(event.type == SDL_QUIT){
-                    thread_exit = 1;
-                } else if(event.type == BREAK_EVENT){
-                    break;
                 }
-
+            } else if (event.type == SDL_QUIT) {
+                thread_exit = 1;
+            } else if (event.type == BREAK_EVENT) {
+                break;
+            } else {
+                continue;
             }
-            av_frame_free(&frame);
-
-        } catch (std::exception ex){
-            cout<<"Exception in play video"<< ex.what()<<endl;
-        } catch(...){
-            cout << "Unknown exception in play media" << endl;
         }
-        grabber.close();
-
-
-
-
+        cout << "video finished" << endl;
+        SDL_CloseAudio();
+        SDL_Quit();
+        return 0;
+    }catch (std::exception ex){
+        cout<<"Exception in play video"<< ex.what()<<endl;
+    } catch(...){
+        cout << "Unknown exception in play media" << endl;
     }
-
-    void playVideo(const string& inputfile){
-        cout << "play video: " << inputfile << endl;
-        try {
-            // playYuvFile(inputPath);
-            playMediaVideo(inputfile);
-        } catch (std::exception ex) {
-            cout << "exception: " << ex.what() << endl;
-        }
-
-    }
-
-
 }
 
-//int main() {
-//    cout << "simple player" << endl;
-//    string inputFile = "/Users/gaohan/Desktop/out1.mp4";
-//    playVideo(inputFile);
-//    return 0;
-//}
+
+
+
